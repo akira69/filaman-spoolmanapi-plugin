@@ -40,6 +40,8 @@ On FilaMan Core 2.x, the API projects native nozzle, bed, and drying settings
 into filament responses, nested spool responses, and downloads. Nozzle and bed
 ranges display their lower available endpoint. Sending that value back preserves
 the range. Changing the scalar sets both endpoints, and `null` clears the range.
+Edit projected extras such as drying settings in FilaMan. The plugin accepts
+unchanged echoes of these values and edits to independently stored custom fields.
 Older Core versions use legacy custom fields for temperature storage.
 
 ### Color compatibility

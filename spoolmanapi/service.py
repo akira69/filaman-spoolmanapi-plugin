@@ -21,6 +21,7 @@ from app.services.spool_service import SpoolService
 
 try:
     import app.services.spoolman_projection as projection
+    from app.services.extra_field_validation import normalize_numeric_range
 except ModuleNotFoundError as exc:
     if exc.name != "app.services.spoolman_projection":
         raise
@@ -50,8 +51,10 @@ def _apply_filament_temperatures(filament: Filament, fields: dict, payload: dict
         if projection is None:
             if value is not None:
                 fields[key] = value
-        elif value is None or value != projection.project_alias_value(filament, key, None, filament=True):
-            setattr(filament, native_field, None if value is None else {"min": value, "max": value})
+        else:
+            native_range = None if value is None else normalize_numeric_range(value)
+            if value is None or value != projection.project_alias_value(filament, key, None, filament=True):
+                setattr(filament, native_field, native_range)
 
 
 def normalize_tag_uid(uid: str) -> str:
@@ -137,7 +140,9 @@ def _decode_filament_extra(extra: dict[str, str] | None) -> dict[str, Any]:
     return values
 
 
-def _without_projected_echoes(extra: dict, stored: dict, projected: dict, explicit) -> dict:
+def _without_projected_echoes(
+    extra: dict, stored: dict, projected: dict, explicit, retained: set[tuple[str, ...]],
+) -> dict:
     result = {}
     for key, value in extra.items():
         if key in explicit or key not in projected:
@@ -149,13 +154,24 @@ def _without_projected_echoes(extra: dict, stored: dict, projected: dict, explic
             # The client may edit a sibling while echoing a derived value in the same object.
             original = stored.get(key)
             original = original if isinstance(original, dict) else {}
-            nested = {}
+            nested = {
+                name: item for name, item in original.items() if (key, name) in retained
+            }
             for name, item in value.items():
-                if name not in projected[key] or not projection._same_source_value(item, projected[key][name]):
+                derived = name in projected[key] and (
+                    (key, name) in retained or name not in original
+                    or not projection._same_source_value(original[name], projected[key][name])
+                )
+                if not derived:
                     nested[name] = item
-                elif name in original:
-                    nested[name] = original[name]
+                elif not projection._same_source_value(item, projected[key][name]):
+                    raise ValueError(f"extra.{key}.{name} is projected from FilaMan and is read-only")
             value = nested
+        elif (
+            key not in stored or not projection._same_source_value(stored[key], projected[key])
+            or any(source[0] == key for source in retained)
+        ):
+            raise ValueError(f"extra.{key} is projected from FilaMan and is read-only")
         result[key] = value
     return result
 
@@ -188,6 +204,32 @@ class SpoolmanService:
 
     def _projection_definitions(self, entity: str) -> dict:
         return self.db.info.get("spoolman_definitions", {}).get(entity, {}) if self.db is not None else {}
+
+    def _retained_extra_sources(self, entity: Filament | Spool, kind: str) -> set[tuple[str, ...]]:
+        stored = entity.custom_fields or {}
+        aliases = entity.label_field_aliases or {}
+        local = entity.custom_field_definitions or {}
+        definitions = self._projection_definitions(kind)
+        sources = set()
+        reserved = projection._FILAMENT_TOP_LEVEL if kind == "filament" else {"comment"}
+        for path, alias in aliases.items():
+            target = projection.alias_target(alias)
+            if (
+                path in reserved or not isinstance(target, str)
+                or target.partition(".")[0] not in projection._NATIVE_FIELDS
+            ):
+                continue
+            source = projection.alias_source(path, alias, aliases)
+            if source is None:
+                continue
+            container = stored if len(source) == 1 else stored.get(source[0])
+            key = source[-1]
+            if not isinstance(container, dict) or key not in container:
+                continue
+            definition = projection.effective_source_definition(path, local, definitions)
+            if projection.owns_retained_source(alias, container[key], definition):
+                sources.add(source)
+        return sources
 
     def _filament_fields(self, filament: Filament) -> dict:
         if projection is None:
@@ -484,7 +526,8 @@ class SpoolmanService:
         extra = _decode_filament_extra(payload.get("extra"))
         if projection is not None and extra:
             extra = _without_projected_echoes(
-                extra, filament.custom_fields or {}, self._filament_fields(filament), _TEMPERATURE_FIELDS
+                extra, filament.custom_fields or {}, self._filament_fields(filament),
+                _TEMPERATURE_FIELDS, self._retained_extra_sources(filament, "filament"),
             )
         if "name" in payload:
             filament.designation = payload["name"] or "Unnamed"
@@ -699,7 +742,8 @@ class SpoolmanService:
         extra = _decode_extra(payload.get("extra"))
         if projection is not None and extra:
             extra = _without_projected_echoes(
-                extra, spool.custom_fields or {}, self._spool_fields(spool), {"card_uids"}
+                extra, spool.custom_fields or {}, self._spool_fields(spool),
+                {"card_uids"}, self._retained_extra_sources(spool, "spool"),
             )
         weight_keys = ("initial_weight", "spool_weight", "remaining_weight", "used_weight")
         weight_changes_requested = [key for key in weight_keys if key in payload]

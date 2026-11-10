@@ -1,6 +1,7 @@
 import ast
 import csv
 import io
+import json
 
 import pytest
 
@@ -61,6 +62,14 @@ async def test_native_temperatures_in_filament_spool_and_downloads(color_api):
     spool = (await color_api.get(f"{api}/spool/{sid}")).json()
     assert spool["extra"]["spoolman_extra"] == '{"rack": "A", "dry": "60.0"}'
 
+    edited_alias = await color_api.patch(f"{api}/spool/{sid}", json={
+        "extra": {"spoolman_extra": '{"dry": "70.0", "rack": "B"}'},
+    })
+    assert edited_alias.status_code == 400, edited_alias.text
+    assert "spoolman_extra.dry" in edited_alias.json()["message"]
+    async with plugin_settings.async_session_maker() as db:
+        assert (await db.get(Spool, sid)).custom_fields == {"spoolman_extra": {"rack": "A"}}
+
 
 @pytest.mark.asyncio
 async def test_spoolman_temperature_writes_preserve_native_ranges_and_clears(color_api):
@@ -96,6 +105,12 @@ async def test_spoolman_temperature_writes_preserve_native_ranges_and_clears(col
     assert response.json().get("settings_extruder_temp") is None
     response = await color_api.patch(f"{api}/{fid}", json={"extra": {"article_number": "123"}})
     assert response.status_code == 422
+    response = await color_api.patch(f"{api}/{fid}", json={"settings_bed_temp": 10**400})
+    assert response.status_code == 422
+    response = await color_api.post(api, json={
+        "vendor_id": 1, "name": "Invalid", "settings_bed_temp": 10**400,
+    })
+    assert response.status_code == 422
     async with plugin_settings.async_session_maker() as db:
         assert (await db.get(Filament, fid)).custom_fields == {"note": "keep"}
 
@@ -107,5 +122,45 @@ async def test_spoolman_temperature_writes_preserve_native_ranges_and_clears(col
         cleared = await db.get(Filament, fid)
         created = await db.get(Filament, response.json()["id"])
         assert cleared.extruder_temp_range_c is None
+        assert cleared.bed_temp_range_c == {"min": 0, "max": 0}
         assert created.extruder_temp_range_c == {"min": 235, "max": 235}
         assert not created.custom_fields
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [False, True])
+async def test_drying_extras_keep_native_and_custom_ownership(color_api, retained):
+    from app.services.spoolman_projection import promotion_alias
+
+    alias = promotion_alias("drying_temp_c", 50, 50)
+    alias["wire"]["retained"] = True
+    async with plugin_settings.async_session_maker() as db:
+        filament = Filament(
+            manufacturer_id=1, designation="PLA", material_type="PLA", diameter_mm=1.75,
+            drying_temp_c=50,
+            custom_fields={"dry_temp": 50} if retained else None,
+            label_field_aliases={"dry_temp": alias} if retained else None,
+        )
+        db.add(filament)
+        await db.commit()
+        fid = filament.id
+
+    url = f"/spoolman/api/v1/filament/{fid}"
+    result = await color_api.patch(url, json={"extra": {"dry_temp": "60"}})
+    assert result.status_code == 422, result.text
+    assert "dry_temp" in result.json()["detail"]
+    async with plugin_settings.async_session_maker() as db:
+        saved = await db.get(Filament, fid)
+        assert saved.custom_fields == ({"dry_temp": 50} if retained else None)
+        saved.drying_temp_c = 70
+        await db.commit()
+    result = await color_api.get(url)
+    assert json.loads(result.json()["extra"]["dry_temp"]) == 70
+
+    async with plugin_settings.async_session_maker() as db:
+        saved = await db.get(Filament, fid)
+        saved.custom_fields = {"dry_temp": 42}
+        await db.commit()
+    result = await color_api.patch(url, json={"extra": {"dry_temp": "45"}})
+    assert result.status_code == 200, result.text
+    assert json.loads(result.json()["extra"]["dry_temp"]) == 45
